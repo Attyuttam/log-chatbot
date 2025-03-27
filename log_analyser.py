@@ -28,7 +28,7 @@ retriever = vector_store.as_retriever(search_kwargs={"k": 5})  # Retrieve only t
 llm = Llama(
     model_path="./models/mistral-7b-instruct-v0.1.Q4_K_M.gguf",
     n_gpu_layers=0,  # Force CPU execution
-    n_threads=8  # Adjust based on CPU cores
+    n_threads=4  # Adjust based on CPU cores
 )
 
 # Step 6: Create a Retrieval-Augmented Generation (RAG) Chain
@@ -70,21 +70,26 @@ So based on this understanding, below are the logs and the query as well as some
 Keep the response **concise, structured, and focused** on the user query.
 """
 )
+def chunk_text(text, chunk_size=1500, overlap=200):
+    """Splits text into overlapping chunks."""
+    chunks = []
+    for i in range(0, len(text), chunk_size - overlap):
+        chunks.append(text[i:i+chunk_size])
+    return chunks
+
 def llm_wrapper(input_text):
     if not isinstance(input_text, str):
         input_text = str(input_text)
 
-    # Truncate context to avoid exceeding LLM limit
-    input_text = input_text[:800]  # Adjust based on the model's context limit
+    chunks = chunk_text(input_text, chunk_size=1500, overlap=200)  # Increase to 1500
+    
+    responses = []
+    for chunk in chunks:
+        trimmed_text = chunk[:400]  # Adjust to fit within 512 tokens (400 input + 100 output)
+        response = llm(trimmed_text, max_tokens=100, temperature=0.2, top_p=0.9)
+        responses.append(response["choices"][0]["text"].strip())
 
-    response = llm(
-        input_text,
-        max_tokens=200,  # Limit response length
-        temperature=0.5, # More consistent responses
-        top_p=0.9
-    )
-    print(f"LLM RESPONSE: {response}")
-    return response["choices"][0]["text"].strip()
+    return " ".join(responses)  
 
 def extract_relevant_logs(logs, query):
     """
@@ -95,29 +100,54 @@ def extract_relevant_logs(logs, query):
 
     return relevant_logs
 
+def summarize_logs(logs, max_message_length=50):
+    """Summarizes logs while preserving timestamp & log level."""
+    summarized_logs = []
+    
+    for log in logs:
+        parts = log.split(" - ", 2)  # Split into [timestamp, log level, message]
+        
+        if len(parts) == 3:
+            timestamp, log_level, message = parts
+            short_message = message[:max_message_length] + "..." if len(message) > max_message_length else message
+            summarized_logs.append(f"{timestamp} - {log_level} - {short_message}")
+        else:
+            summarized_logs.append(log)  # In case of an unexpected format, keep original
+
+    return "\n".join(summarized_logs)
+
 combine_documents_chain = create_stuff_documents_chain(llm_wrapper, prompt)
 qa_chain = create_retrieval_chain(retriever, combine_documents_chain)
 
-# Step 7: Ask a question
-query = "What are the recent errors related to account 123?"
-retrieved_docs = retriever.get_relevant_documents(query)
-retrieved_logs = [doc.page_content for doc in retrieved_docs]  # Extract raw log text
+# Continuous Query Mode
+print("\n🔹 **Log Analysis Chatbot** 🔹")
+print("Type your query below. Type 'exit' to quit.\n")
 
-# Run LLM-based QA
-filtered_logs = extract_relevant_logs(retrieved_logs, query)
+while True:
+    query = input("🔎 Enter your query: ")
+    if query.lower() == "exit":
+        print("\n👋 Exiting Log Analysis Chatbot. Goodbye!")
+        break
+    
+    # Retrieve relevant logs
+    retrieved_docs = retriever.get_relevant_documents(query)
+    retrieved_logs = summarize_logs([doc.page_content for doc in retrieved_docs])
 
-formatted_logs = "\n".join(["- " + log.replace("\n", " ") for log in filtered_logs])
-response = qa_chain.invoke({"input": query, "context": formatted_logs})
+    # Filter logs based on query
+    filtered_logs = extract_relevant_logs(retrieved_logs, query)
+    formatted_logs = "\n".join(["- " + log.replace("\n", " ") for log in filtered_logs])
 
-print(response)
-# Step 10: Format the final output
+    # Run LLM-based QA
+    response = qa_chain.invoke({"input": query, "context": formatted_logs})
 
-formatted_response = {
-    "query": query,
-    "response": {
-        "summary": response.get("answer", "No relevant data found."), 
-        "relevant_logs": retrieved_logs  # Include raw logs related to the query
+    # Format and display output
+    formatted_response = {
+        "query": query,
+        "response": {
+            "summary": response.get("answer", "No relevant data found."),
+            "relevant_logs": retrieved_logs  # Include raw logs related to the query
+        }
     }
-}
-# Print prettified JSON output
-print(json.dumps(formatted_response, indent=4))
+    
+    print(json.dumps(formatted_response, indent=4))
+    print("\n🔹 Ask another query or type 'exit' to quit.")
